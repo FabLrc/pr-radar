@@ -1,0 +1,62 @@
+{
+  "name": "pr-radar",
+  "displayName": "PR Radar",
+  "description": "Signale les fichiers modifiés par des pull requests ouvertes pour anticiper les conflits.",
+  "version": "0.0.1",
+  "publisher": "your-name",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["SCM Providers", "Other"],
+  "activationEvents": ["workspaceContains:.git"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "prRadar.refresh",
+        "title": "PR Radar: Rafraîchir les PR ouvertes",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "prRadar.showPrsForFile",
+        "title": "PR Radar: Voir les PR qui touchent ce fichier"
+      }
+    ],
+    "configuration": {
+      "title": "PR Radar",
+      "properties": {
+        "prRadar.refreshIntervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "Fréquence de rafraîchissement des PR ouvertes (en minutes)."
+        },
+        "prRadar.ignoreOwnPrs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ignorer les PR dont vous êtes l'auteur."
+        },
+        "prRadar.ignoreDrafts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ignorer les PR en brouillon (draft)."
+        },
+        "prRadar.warnOnEdit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Afficher un avertissement la première fois que vous modifiez un fichier concerné par une PR."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
