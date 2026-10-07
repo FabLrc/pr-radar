@@ -1,12 +1,20 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { getRepoInfo, RepoInfo } from './git';
+import { getGitApi, getRepoInfo, GitRepository, RepoInfo, repoStateKey } from './git';
 import { buildIndex, fetchOpenPrs, PrIndex, PrInfo } from './github';
 
+type Health = { kind: 'ok' } | { kind: 'signin' } | { kind: 'error'; message: string };
+
 let index: PrIndex = new Map();
-let repo: RepoInfo | undefined;
+let repo: RepoInfo | undefined;       // dépôt auquel correspond `index`
+let gitRepo: GitRepository | undefined;
+let health: Health = { kind: 'ok' };
+let partial = false;                  // l'index ne couvre pas toutes les PR ouvertes
+let generation = 0;                   // incrémenté à chaque refresh : seul le plus récent s'applique
 let timer: NodeJS.Timeout | undefined;
-const warnedFiles = new Set<string>();
+let log: vscode.LogOutputChannel;
+/** Avertissements déjà affichés ; clé = fichier + PR concernées. */
+const warned = new Set<string>();
 
 // ---------- Utilitaires ----------
 
@@ -54,80 +62,127 @@ class PrDecorationProvider implements vscode.FileDecorationProvider {
 const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 
 function updateStatus(editor = vscode.window.activeTextEditor) {
-  const prs = editor ? prsFor(editor.document.uri) : [];
-  if (prs.length === 0) {
-    statusItem.hide();
+  if (health.kind === 'signin') {
+    statusItem.text = '$(github) PR Radar : se connecter';
+    statusItem.tooltip = 'Se connecter à GitHub pour récupérer les PR ouvertes';
+    statusItem.command = 'prRadar.refresh';
+    statusItem.backgroundColor = undefined;
+    statusItem.show();
     return;
   }
-  statusItem.text = `$(git-pull-request) ${prs.length} PR sur ce fichier`;
-  statusItem.tooltip = prs.map(p => `#${p.number} ${p.title} (@${p.author})`).join('\n');
-  statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-  statusItem.command = 'prRadar.showPrsForFile';
-  statusItem.show();
+
+  const notes: string[] = [];
+  if (partial) notes.push('Index partiel : seules les PR les plus récemment mises à jour sont analysées.');
+  if (health.kind === 'error') notes.push(`Dernier rafraîchissement en échec : ${health.message}`);
+
+  const prs = editor ? prsFor(editor.document.uri) : [];
+  if (prs.length > 0) {
+    statusItem.text = `$(git-pull-request) ${prs.length} PR sur ce fichier`;
+    statusItem.tooltip = [prs.map(p => `#${p.number} ${p.title} (@${p.author})`).join('\n'), ...notes].join('\n\n');
+    statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    statusItem.command = 'prRadar.showPrsForFile';
+    statusItem.show();
+  } else if (health.kind === 'error') {
+    statusItem.text = '$(warning) PR Radar';
+    statusItem.tooltip = `${notes.join('\n\n')}\n\nCliquer pour réessayer.`;
+    statusItem.backgroundColor = undefined;
+    statusItem.command = 'prRadar.refresh';
+    statusItem.show();
+  } else {
+    statusItem.hide();
+  }
 }
 
 // ---------- Rafraîchissement ----------
 
 async function refresh(decorations: PrDecorationProvider, interactive = false) {
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) return;
+  const gen = ++generation;
+  const stale = () => gen !== generation;
+
+  if (!gitRepo) {
+    repo = undefined;
+    index = new Map();
+    partial = false;
+    health = { kind: 'ok' };
+    decorations.refresh();
+    updateStatus();
+    if (interactive) {
+      vscode.window.showInformationMessage('PR Radar : aucun dépôt Git détecté dans cet espace de travail.');
+    }
+    return;
+  }
 
   try {
-    repo = await getRepoInfo(folder.uri.fsPath);
+    const info = getRepoInfo(gitRepo);
 
     const session = await vscode.authentication.getSession('github', ['repo'], {
       createIfNone: interactive,
       silent: !interactive,
     });
+    if (stale()) return;
     if (!session) {
-      statusItem.text = '$(github) PR Radar : se connecter';
-      statusItem.command = 'prRadar.refresh';
-      statusItem.backgroundColor = undefined;
-      statusItem.show();
+      health = { kind: 'signin' };
+      updateStatus();
       return;
     }
 
     const me = session.account.label;
-    const { ignoreOwnPrs, ignoreDrafts } = {
-      ignoreOwnPrs: config().get<boolean>('ignoreOwnPrs', true),
-      ignoreDrafts: config().get<boolean>('ignoreDrafts', false),
-    };
+    const ignoreOwnPrs = config().get<boolean>('ignoreOwnPrs', true);
+    const ignoreDrafts = config().get<boolean>('ignoreDrafts', false);
 
-    const all = await fetchOpenPrs(session.accessToken, repo.owner, repo.repo);
-    const relevant = all.filter(({ pr }) =>
-      pr.branch !== repo!.branch &&                 // pas la PR de ma branche
+    const { prs, truncated } = await fetchOpenPrs(session.accessToken, info.owner, info.repo);
+    if (stale()) return;
+
+    const own = info.ownBranch;
+    const relevant = prs.filter(({ pr }) =>
+      // pas la PR de ma branche : même nom distant ET même propriétaire (fork)
+      !(own && pr.branch === own.branch && pr.headOwner?.toLowerCase() === own.owner.toLowerCase()) &&
       !(ignoreOwnPrs && pr.author === me) &&
       !(ignoreDrafts && pr.isDraft),
     );
 
+    repo = info;
     index = buildIndex(relevant);
+    partial = truncated;
+    health = { kind: 'ok' };
     decorations.refresh();
     updateStatus();
 
+    if (truncated) {
+      log.warn(`Plus de ${prs.length} PR ouvertes sur ${info.owner}/${info.repo} : seules les ${prs.length} plus récemment mises à jour sont analysées.`);
+    }
+    log.info(`${info.owner}/${info.repo} : ${relevant.length} PR retenues sur ${prs.length}, ${index.size} fichiers surveillés.`);
     if (interactive) {
       vscode.window.setStatusBarMessage(
         `PR Radar : ${relevant.length} PR ouvertes, ${index.size} fichiers surveillés`, 4000);
     }
-  } catch (err: any) {
-    console.error('[PR Radar]', err);
+  } catch (err) {
+    if (stale()) return;
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(err instanceof Error ? err : message);
+    health = { kind: 'error', message };
+    updateStatus();
     if (interactive) {
-      vscode.window.showErrorMessage(`PR Radar : ${err.message ?? err}`);
+      const choice = await vscode.window.showErrorMessage(`PR Radar : ${message}`, 'Voir le journal');
+      if (choice) log.show();
     }
   }
 }
 
 function schedule(decorations: PrDecorationProvider) {
-  if (timer) clearInterval(timer);
+  clearInterval(timer);
   const minutes = Math.max(1, config().get<number>('refreshIntervalMinutes', 5));
   timer = setInterval(() => refresh(decorations), minutes * 60_000);
 }
 
 // ---------- Activation ----------
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
+  log = vscode.window.createOutputChannel('PR Radar', { log: true });
   const decorations = new PrDecorationProvider();
 
   context.subscriptions.push(
+    log,
     statusItem,
     vscode.window.registerFileDecorationProvider(decorations),
 
@@ -154,14 +209,17 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.onDidChangeActiveTextEditor(e => updateStatus(e)),
 
     // Avertissement à la première modification d'un fichier concerné
+    // (de nouveau si l'ensemble des PR qui le touchent change).
     vscode.workspace.onDidChangeTextDocument(e => {
       if (!config().get<boolean>('warnOnEdit', true) || e.contentChanges.length === 0) return;
       const rel = relPath(e.document.uri);
-      if (!rel || warnedFiles.has(rel)) return;
+      if (!rel) return;
       const prs = index.get(rel);
       if (!prs?.length) return;
+      const key = `${rel}#${prs.map(p => p.number).sort((a, b) => a - b).join(',')}`;
+      if (warned.has(key)) return;
 
-      warnedFiles.add(rel);
+      warned.add(key);
       const list = prs.map(p => `#${p.number}`).join(', ');
       vscode.window
         .showWarningMessage(
@@ -180,25 +238,52 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
 
-    // Changement de branche -> on recalcule (la PR "à soi" change)
+    // Connexion / déconnexion GitHub
     vscode.authentication.onDidChangeSessions(e => {
       if (e.provider.id === 'github') refresh(decorations);
     }),
   );
 
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (folder) {
-    const headWatcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(folder, '.git/HEAD'),
-    );
-    headWatcher.onDidChange(() => refresh(decorations));
-    context.subscriptions.push(headWatcher);
+  const git = await getGitApi();
+  if (!git) {
+    health = { kind: 'error', message: "l'extension Git intégrée de VS Code est désactivée." };
+    log.error(health.message);
+    updateStatus();
+    return;
   }
 
-  refresh(decorations);
+  // Dépôt suivi : celui qui contient le premier dossier de l'espace de travail
+  // (même ouvert dans un sous-dossier ou un worktree), sinon le premier détecté.
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  let stateKey = '';
+  let repoListener: vscode.Disposable | undefined;
+  context.subscriptions.push({ dispose: () => repoListener?.dispose() });
+
+  const selectRepo = () => {
+    const next = (folder && git.getRepository(folder.uri)) || git.repositories[0];
+    if (next?.rootUri.toString() === gitRepo?.rootUri.toString()) return;
+
+    repoListener?.dispose();
+    gitRepo = next;
+    stateKey = next ? repoStateKey(next) : '';
+    // Changement de branche, d'upstream ou de remotes -> on recalcule (la PR "à soi" change)
+    repoListener = next?.state.onDidChange(() => {
+      const key = repoStateKey(next);
+      if (key === stateKey) return;
+      stateKey = key;
+      refresh(decorations);
+    });
+    refresh(decorations);
+  };
+
+  context.subscriptions.push(
+    git.onDidOpenRepository(selectRepo),
+    git.onDidCloseRepository(selectRepo),
+  );
+  selectRepo();
   schedule(decorations);
 }
 
 export function deactivate() {
-  if (timer) clearInterval(timer);
+  clearInterval(timer);
 }

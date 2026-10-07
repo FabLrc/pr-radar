@@ -2,13 +2,14 @@
   "name": "pr-radar",
   "displayName": "PR Radar",
   "description": "Signale les fichiers modifiés par des pull requests ouvertes pour anticiper les conflits.",
-  "version": "0.0.1",
-  "publisher": "your-name",
+  "version": "1.0.0",
+  "publisher": "FabLrc",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": ["SCM Providers", "Other"],
-  "activationEvents": ["workspaceContains:.git"],
+  "activationEvents": ["onStartupFinished"],
+  "extensionDependencies": ["vscode.git"],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
