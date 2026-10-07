@@ -121,6 +121,17 @@ async function refresh(decorations: PrDecorationProvider, interactive = false) {
     });
     if (stale()) return;
     if (!session) {
+      // Notification seulement à l'entrée dans cet état : pas de relance à chaque rafraîchissement périodique.
+      if (health.kind !== 'signin') {
+        vscode.window
+          .showInformationMessage(
+            'PR Radar : connectez-vous à GitHub pour être averti des PR ouvertes qui touchent vos fichiers.',
+            'Se connecter',
+          )
+          .then(choice => {
+            if (choice) vscode.commands.executeCommand('prRadar.refresh');
+          });
+      }
       health = { kind: 'signin' };
       updateStatus();
       return;
